@@ -202,18 +202,58 @@ void UCTNode::virtual_loss_undo() {
     m_virtual_loss -= VIRTUAL_LOSS_COUNT;
 }
 
+// Orig version. Value is average of leaf descendant values.
+//------------------------------------------------------------
 void UCTNode::update(float eval) {
+    static int NEWSEARCH = 1;
+    if (NEWSEARCH) {
+        //float visits_cache = m_visits;
+        //float eval_cache = m_blackevals;
+        update_softmax_avg( eval);
+        //std::cerr << ">>>> " << m_visits << " " << m_blackevals << '\n';
+        //m_visits = visits_cache;
+        //m_blackevals = eval_cache;
+        return;
+    }
     // Cache values to avoid race conditions.
     auto old_eval = static_cast<float>(m_blackevals);
     auto old_visits = static_cast<int>(m_visits);
     auto old_delta = old_visits > 0 ? eval - old_eval / old_visits : 0.0f;
-    m_visits++;
+    m_visits += 1.0; // m_visits++;
     accumulate_eval(eval);
     auto new_delta = eval - (old_eval + eval) / (old_visits + 1);
     // Welford's online algorithm for calculating variance.
     auto delta = old_delta * new_delta;
     atomic_add(m_squared_eval_diff, delta);
-}
+    //std::cerr << "#### " << m_visits << " " << m_blackevals << "\n\n";
+} // update()
+
+// New version. Somewhere between average and max.
+// T -> 0 =>  max; T -> inf => avg
+// AHN
+//-----------------------------------------------------
+void UCTNode::update_softmax_avg( float eval) {
+    const float T = 80.0; // 100.0; // 5.0; // 1.0;
+    auto old_eval = static_cast<float>(m_blackevals);
+    auto old_visits = static_cast<int>(m_visits);
+    auto old_delta = old_visits > 0 ? eval - old_eval / old_visits : 0.0f;
+
+    auto x = exp( eval / T);
+    auto newsum = m_visits + x;
+    //auto new_weight = x / newsum;
+    //auto old_weight = 1.0 - new_weight;
+    //auto new_eval = old_eval * old_weight + eval * new_weight;
+    m_visits = newsum;
+    //m_blackevals = new_eval;
+    atomic_add( m_blackevals, eval*x);
+
+    // Update variance estimate of eval over time
+    auto new_delta = eval - (old_eval + eval) / (newsum);
+    // Welford's online algorithm for calculating variance.
+    float delta = old_delta * new_delta;
+    atomic_add( m_squared_eval_diff, delta);
+} // update_softmax_avg()
+
 
 bool UCTNode::has_children() const {
     return m_min_psa_ratio_children <= 1.0f;
@@ -222,7 +262,7 @@ bool UCTNode::has_children() const {
 bool UCTNode::expandable(const float min_psa_ratio) const {
 #ifndef NDEBUG
     if (m_min_psa_ratio_children == 0.0f) {
-        // If we figured out that we are fully expandable
+        // If we figured out thatcc we are fully expandable
         // it is impossible that we stay in INITIAL state.
         assert(m_expand_state.load() != ExpandState::INITIAL);
     }
@@ -298,72 +338,51 @@ void UCTNode::accumulate_eval(float eval) {
 }
 
 UCTNode* UCTNode::uct_select_child(int color, bool is_root) {
-    (void)is_root;
     wait_expanded();
 
-    // Children are sorted by descending policy.
-    // An unvisited child gets the lowest winrate *to the left* .
-    // We need the array because an unvisited child can be followed by visited ones.
-    // Also, cache everything to minimize threading inconsistencies.
-    // This is not paranoia. I tried.
-    float winrates[362]; // On the stack. No mallocs.
-    int visits[362];
-    int idx = -1;
-    // Do this as quickly as possible. Ideally we should lock the node.
-    for (auto& child : m_children) {
-        idx++;
-        visits[idx] = child.get_visits();
-        if (visits[idx]) {
-            winrates[idx] = child.get_eval(color);
-        }
-    }
-
-    float smallest_winrate = get_net_eval(color); // Important. Do no start with anything else.
-    int parentvisits = 0;
-    idx = -1;
-    for (auto& child : m_children) {
-        idx++;
-        if (visits[idx] > 0) {
-            if (child.active()) {
-                if (child.is_inflated() && child->m_expand_state.load() == ExpandState::EXPANDING) {
-                    // // Someone else is expanding this node, do nothing
-                } else {
-                    smallest_winrate = std::min(smallest_winrate, winrates[idx]);
-                }
-            }
-        } else {
-            winrates[idx] = smallest_winrate;
-        }
+    // Count parentvisits manually to avoid issues with transpositions.
+    auto total_visited_policy = 0.0f;
+    auto parentvisits = size_t{0};
+    for (const auto& child : m_children) {
         if (child.valid()) {
-            parentvisits += visits[idx];
+            parentvisits += child.get_visits();
+            if (child.get_visits() > 0) {
+                total_visited_policy += child.get_policy();
+            }
         }
     }
 
     const auto numerator = std::sqrt(double(parentvisits) *
             std::log(cfg_logpuct * double(parentvisits) + cfg_logconst));
+    const auto fpu_reduction = (is_root ? cfg_fpu_root_reduction : cfg_fpu_reduction) * std::sqrt(total_visited_policy);
+    // Estimated eval for unknown nodes = original parent NN eval - reduction
+    const auto fpu_eval = get_net_eval(color) - fpu_reduction;
 
     auto best = static_cast<UCTNodePointer*>(nullptr);
     auto best_value = std::numeric_limits<double>::lowest();
 
-    idx = -1;
     for (auto& child : m_children) {
-        idx++;
         if (!child.active()) {
             continue;
         }
+
+        auto winrate = fpu_eval;
+        if (child.is_inflated() && child->m_expand_state.load() == ExpandState::EXPANDING) {
+            // Someone else is expanding this node, never select it
+            // if we can avoid so, because we'd block on it.
+            winrate = -1.0f - fpu_reduction;
+        } else if (child.get_visits() > 0) {
+            winrate = child.get_eval(color);
+        }
         const auto psa = child.get_policy();
-        const auto denom = 1.0 + visits[idx];
+        const auto denom = 1.0 + child.get_visits();
         const auto puct = cfg_puct * psa * (numerator / denom);
-        const auto value = winrates[idx] + puct;
+        const auto value = winrate + puct;
         assert(value > std::numeric_limits<double>::lowest());
 
         if (value > best_value) {
-            if (child.is_inflated() && child->m_expand_state.load() == ExpandState::EXPANDING) {
-                // Someone else is expanding this node, never select it
-            } else {
-                best_value = value;
-                best = &child;
-            }
+            best_value = value;
+            best = &child;
         }
     }
 

@@ -83,6 +83,7 @@ public:
     void virtual_loss();
     void virtual_loss_undo();
     void update(float eval);
+    void update_softmax_avg( float eval);
     float get_eval_lcb(int color) const;
 
     // Defined in UCTNodeRoot.cpp, only to be called on m_root in UCTSearch
@@ -119,7 +120,9 @@ private:
     std::int16_t m_move;
     // UCT
     std::atomic<std::int16_t> m_virtual_loss{0};
-    std::atomic<int> m_visits{0};
+    //std::atomic<int> m_visits{0};
+    //std::atomic<float> m_visits{0};
+    float m_visits{0};
     // UCT eval
     float m_policy;
     // Original net eval for this node (not children).
